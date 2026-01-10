@@ -23,7 +23,7 @@ LON <- -79.38
 STATE_FILE <- "freeze_state.json"
 
 # TEST MODE: Set to TRUE to send temp update every run, FALSE for freeze alerts only
-TEST_MODE <- TRUE  # Change to FALSE when ready for production
+TEST_MODE <- FALSE  # Change to FALSE when ready for production
 
 # ============================================================================
 # HELPER FUNCTIONS
