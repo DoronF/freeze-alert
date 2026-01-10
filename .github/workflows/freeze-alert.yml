@@ -19,6 +19,14 @@ jobs:
         with:
           r-version: '4.3.0'
       
+      - name: Cache state file
+        uses: actions/cache@v3
+        with:
+          path: freeze_state.json
+          key: freeze-state-${{ github.run_id }}
+          restore-keys: |
+            freeze-state-
+      
       - name: Setup R dependencies
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
@@ -32,18 +40,3 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
           Rscript freeze_alert.R
-          
-      - name: Commit state file changes
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add freeze_state.json || true
-          git diff --quiet && git diff --staged --quiet || git commit -m "Update freeze state [skip ci]" || true
-        continue-on-error: true
-          
-      - name: Push changes
-        uses: ad-m/github-push-action@master
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          branch: ${{ github.ref }}
-        continue-on-error: true
