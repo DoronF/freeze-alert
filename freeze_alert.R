@@ -20,6 +20,9 @@ LON <- -79.38
 # State file for tracking
 STATE_FILE <- "freeze_state.json"
 
+# TEST MODE: Set to TRUE to send temp update every run, FALSE for freeze alerts only
+TEST_MODE <- TRUE  # Change to FALSE when ready for production
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
@@ -121,6 +124,42 @@ main <- function() {
     cat("Precipitation detected! Updated last_precip_time\n")
   }
   
+  # ============================================================================
+  # TEST MODE: Send current temp every run
+  # ============================================================================
+  if (TEST_MODE) {
+    days_dry <- days_since_precip(state$last_precip_time)
+    
+    if (is.null(days_dry)) {
+      precip_msg <- "No recent precipitation data"
+    } else if (days_dry < 0.5) {
+      precip_msg <- sprintf("Rain/snow within last 12 hours")
+    } else if (days_dry < 1) {
+      precip_msg <- sprintf("Precipitation %.1f days ago", days_dry)
+    } else {
+      precip_msg <- sprintf("Dry for %.1f days", days_dry)
+    }
+    
+    message <- sprintf(
+      "🌡️ Test Mode - Temperature Check\n\nCurrent: %.1f°C\n%s\n\n(Will alert at 0°C when test mode disabled)",
+      current_temp,
+      precip_msg
+    )
+    
+    cat("\n*** SENDING TEST NOTIFICATION ***\n")
+    cat(message, "\n")
+    send_alert(message, priority = "default")
+    
+    # Save state and exit
+    save_state(state)
+    cat("\nTest mode active. Check complete.\n")
+    return()
+  }
+  
+  # ============================================================================
+  # PRODUCTION MODE: Freeze detection logic
+  # ============================================================================
+  
   # Check if we should alert
   should_alert <- FALSE
   
@@ -143,12 +182,12 @@ main <- function() {
     }
     
     message <- sprintf(
-      "Temperature at freezing: %.1f°C\n\n%s\n\nTime to salt the sidewalk!",
+      "❄️ FREEZE ALERT\n\nTemperature at freezing: %.1f°C\n\n%s\n\nTime to salt the sidewalk!",
       current_temp,
       risk_msg
     )
     
-    cat("\n*** SENDING ALERT ***\n")
+    cat("\n*** SENDING FREEZE ALERT ***\n")
     cat(message, "\n")
     
     if (send_alert(message, priority = "high")) {
