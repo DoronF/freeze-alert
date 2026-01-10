@@ -1,7 +1,9 @@
 #!/usr/bin/env Rscript
 
 # Freeze Alert System for Toronto Midtown
-# Alerts when temperature drops to/below 0°C
+# Two-alert system:
+#   1. ~3 hours before freeze (forecast-based)
+#   2. At 0°C (actual temperature)
 # Tracks days since precipitation for ice risk assessment
 
 library(httr)
@@ -27,7 +29,7 @@ TEST_MODE <- TRUE  # Change to FALSE when ready for production
 # HELPER FUNCTIONS
 # ============================================================================
 
-get_weather <- function() {
+get_current_weather <- function() {
   url <- sprintf(
     "https://api.openweathermap.org/data/2.5/weather?lat=%s&lon=%s&appid=%s&units=metric",
     LAT, LON, OPENWEATHER_API_KEY
@@ -35,7 +37,22 @@ get_weather <- function() {
   
   response <- GET(url)
   if (status_code(response) != 200) {
-    stop("Weather API error: ", status_code(response))
+    stop("Current weather API error: ", status_code(response))
+  }
+  
+  content(response, as = "parsed")
+}
+
+get_forecast <- function() {
+  # 5-day forecast with 3-hour intervals (free tier)
+  url <- sprintf(
+    "https://api.openweathermap.org/data/2.5/forecast?lat=%s&lon=%s&appid=%s&units=metric",
+    LAT, LON, OPENWEATHER_API_KEY
+  )
+  
+  response <- GET(url)
+  if (status_code(response) != 200) {
+    stop("Forecast API error: ", status_code(response))
   }
   
   content(response, as = "parsed")
@@ -46,7 +63,8 @@ load_state <- function() {
     fromJSON(STATE_FILE)
   } else {
     list(
-      last_alert_time = NULL,
+      last_alert_3hr = NULL,
+      last_alert_freeze = NULL,
       temp_was_above_zero = TRUE,
       last_precip_time = NULL
     )
@@ -91,6 +109,13 @@ days_since_precip <- function(last_precip_time) {
   round(days, 1)
 }
 
+hours_until <- function(timestamp) {
+  hours <- as.numeric(difftime(as.POSIXct(timestamp, origin = "1970-01-01", tz = "UTC"),
+                               Sys.time(),
+                               units = "hours"))
+  round(hours, 1)
+}
+
 # ============================================================================
 # MAIN LOGIC
 # ============================================================================
@@ -100,20 +125,23 @@ main <- function() {
   cat("Time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
   
   # Get current weather
-  weather <- get_weather()
-  current_temp <- weather$main$temp
+  current <- get_current_weather()
+  current_temp <- current$main$temp
   
-  # Check for recent precipitation
+  # Check for current precipitation
   has_precip <- FALSE
-  if (!is.null(weather$rain$`1h`) && weather$rain$`1h` > 0) {
+  if (!is.null(current$rain$`1h`) && current$rain$`1h` > 0) {
     has_precip <- TRUE
   }
-  if (!is.null(weather$snow$`1h`) && weather$snow$`1h` > 0) {
+  if (!is.null(current$snow$`1h`) && current$snow$`1h` > 0) {
     has_precip <- TRUE
   }
   
   cat("Current temp:", current_temp, "°C\n")
   cat("Precipitation now:", has_precip, "\n")
+  
+  # Get forecast
+  forecast <- get_forecast()
   
   # Load state
   state <- load_state()
@@ -124,11 +152,38 @@ main <- function() {
     cat("Precipitation detected! Updated last_precip_time\n")
   }
   
+  # Check forecast for precipitation in next entries
+  for (entry in forecast$list[1:min(8, length(forecast$list))]) {  # Check next 24 hours
+    if (!is.null(entry$rain$`3h`) && entry$rain$`3h` > 0) {
+      if (is.null(state$last_precip_time)) {
+        state$last_precip_time <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+        cat("Forecast shows precipitation - updating last_precip_time\n")
+      }
+      break
+    }
+    if (!is.null(entry$snow$`3h`) && entry$snow$`3h` > 0) {
+      if (is.null(state$last_precip_time)) {
+        state$last_precip_time <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+        cat("Forecast shows precipitation - updating last_precip_time\n")
+      }
+      break
+    }
+  }
+  
   # ============================================================================
   # TEST MODE: Send current temp every run
   # ============================================================================
   if (TEST_MODE) {
     days_dry <- days_since_precip(state$last_precip_time)
+    
+    # Check forecast for freeze
+    freeze_forecast <- NULL
+    for (entry in forecast$list[1:min(4, length(forecast$list))]) {  # Next ~12 hours
+      if (entry$main$temp <= 0) {
+        freeze_forecast <- entry
+        break
+      }
+    }
     
     if (is.null(days_dry)) {
       precip_msg <- "No recent precipitation data"
@@ -140,10 +195,18 @@ main <- function() {
       precip_msg <- sprintf("Dry for %.1f days", days_dry)
     }
     
+    if (!is.null(freeze_forecast)) {
+      hrs <- hours_until(freeze_forecast$dt)
+      forecast_msg <- sprintf("\nFreeze forecast in ~%.1f hours", hrs)
+    } else {
+      forecast_msg <- "\nNo freeze in next 12 hours"
+    }
+    
     message <- sprintf(
-      "🌡️ Test Mode - Temperature Check\n\nCurrent: %.1f°C\n%s\n\n(Will alert at 0°C when test mode disabled)",
+      "🌡️ Test Mode - Temperature Check\n\nCurrent: %.1f°C\n%s%s\n\n(Will alert at freeze when test mode disabled)",
       current_temp,
-      precip_msg
+      precip_msg,
+      forecast_msg
     )
     
     cat("\n*** SENDING TEST NOTIFICATION ***\n")
@@ -157,32 +220,61 @@ main <- function() {
   }
   
   # ============================================================================
-  # PRODUCTION MODE: Freeze detection logic
+  # PRODUCTION MODE: Two-alert freeze detection
   # ============================================================================
   
-  # Check if we should alert
-  should_alert <- FALSE
-  
-  if (current_temp <= 0 && state$temp_was_above_zero) {
-    # Temperature just dropped to/below freezing
-    should_alert <- TRUE
-    state$temp_was_above_zero <- FALSE
-    
-    # Build alert message
-    days_dry <- days_since_precip(state$last_precip_time)
-    
+  # Helper function to build precipitation message
+  build_precip_msg <- function(days_dry) {
     if (is.null(days_dry)) {
-      risk_msg <- "No recent precipitation data"
+      return("No recent precipitation data")
     } else if (days_dry < 0.5) {
-      risk_msg <- sprintf("Rain/snow within last 12 hours - HIGH ICE RISK ⚠️")
+      return("Rain/snow within last 12 hours - HIGH ICE RISK ⚠️")
     } else if (days_dry < 1) {
-      risk_msg <- sprintf("Precipitation %.1f days ago - MODERATE RISK", days_dry)
+      return(sprintf("Precipitation %.1f days ago - MODERATE RISK", days_dry))
     } else {
-      risk_msg <- sprintf("Dry for %.1f days - lower ice risk", days_dry)
+      return(sprintf("Dry for %.1f days - lower ice risk", days_dry))
     }
+  }
+  
+  # ALERT 1: Check for freeze in next ~3 hours (forecast-based)
+  freeze_in_3hrs <- NULL
+  for (entry in forecast$list[1:min(2, length(forecast$list))]) {  # Next 2 entries = ~6 hours
+    entry_time <- as.POSIXct(entry$dt, origin = "1970-01-01", tz = "UTC")
+    hrs_until_entry <- hours_until(entry$dt)
+    
+    if (entry$main$temp <= 0 && hrs_until_entry > 0 && hrs_until_entry <= 4) {
+      freeze_in_3hrs <- list(temp = entry$main$temp, hours = hrs_until_entry)
+      break
+    }
+  }
+  
+  # Check if we should send 3-hour warning
+  if (!is.null(freeze_in_3hrs) && is.null(state$last_alert_3hr)) {
+    days_dry <- days_since_precip(state$last_precip_time)
+    risk_msg <- build_precip_msg(days_dry)
     
     message <- sprintf(
-      "❄️ FREEZE ALERT\n\nTemperature at freezing: %.1f°C\n\n%s\n\nTime to salt the sidewalk!",
+      "❄️ FREEZE WARNING\n\nTemperature forecast to drop below freezing in approximately %.0f hours\n\nForecast: %.1f°C\n\n%s\n\nPrepare to salt the sidewalk!",
+      freeze_in_3hrs$hours,
+      freeze_in_3hrs$temp,
+      risk_msg
+    )
+    
+    cat("\n*** SENDING 3-HOUR WARNING ***\n")
+    cat(message, "\n")
+    
+    if (send_alert(message, priority = "high")) {
+      state$last_alert_3hr <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    }
+  }
+  
+  # ALERT 2: Check if currently at/below freezing
+  if (current_temp <= 0 && state$temp_was_above_zero) {
+    days_dry <- days_since_precip(state$last_precip_time)
+    risk_msg <- build_precip_msg(days_dry)
+    
+    message <- sprintf(
+      "❄️ FREEZE ALERT - ACT NOW\n\nTemperature at freezing: %.1f°C\n\n%s\n\nTime to salt the sidewalk!",
       current_temp,
       risk_msg
     )
@@ -190,16 +282,21 @@ main <- function() {
     cat("\n*** SENDING FREEZE ALERT ***\n")
     cat(message, "\n")
     
-    if (send_alert(message, priority = "high")) {
-      state$last_alert_time <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    if (send_alert(message, priority = "urgent")) {
+      state$last_alert_freeze <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
     }
     
+    state$temp_was_above_zero <- FALSE
+    
   } else if (current_temp > 0) {
-    # Temperature is above freezing - reset flag
+    # Temperature is above freezing - reset flags
     if (!state$temp_was_above_zero) {
       cat("Temperature back above freezing - resetting alert state\n")
     }
     state$temp_was_above_zero <- TRUE
+    state$last_alert_3hr <- NULL  # Reset 3-hour warning for next freeze event
+    state$last_alert_freeze <- NULL
+    
   } else {
     # Temperature is below zero but we already alerted
     cat("Temperature still below freezing (already alerted)\n")
