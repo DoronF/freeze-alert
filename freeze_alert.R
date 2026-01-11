@@ -23,7 +23,7 @@ LON <- -79.38
 STATE_FILE <- "freeze_state.json"
 
 # TEST MODE: Set to TRUE to send temp update every run, FALSE for freeze alerts only
-TEST_MODE <- FALSE  # Change to FALSE when ready for production
+TEST_MODE <- TRUE  # Change to FALSE when ready for production
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -121,8 +121,11 @@ hours_until <- function(timestamp) {
 # ============================================================================
 
 main <- function() {
+  # Set timezone to Toronto
+  Sys.setenv(TZ = "America/Toronto")
+  
   cat("=== Freeze Alert Check ===\n")
-  cat("Time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+  cat("Time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"), "\n")
   
   # Get current weather
   current <- get_current_weather()
@@ -148,7 +151,7 @@ main <- function() {
   
   # Update precipitation tracking
   if (has_precip) {
-    state$last_precip_time <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    state$last_precip_time <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
     cat("Precipitation detected! Updated last_precip_time\n")
   }
   
@@ -264,7 +267,7 @@ main <- function() {
     cat(message, "\n")
     
     if (send_alert(message, priority = "high")) {
-      state$last_alert_3hr <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+      state$last_alert_3hr <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
     }
   }
   
@@ -283,7 +286,7 @@ main <- function() {
     cat(message, "\n")
     
     if (send_alert(message, priority = "urgent")) {
-      state$last_alert_freeze <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+      state$last_alert_freeze <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
     }
     
     state$temp_was_above_zero <- FALSE
