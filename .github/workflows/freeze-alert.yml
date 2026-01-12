@@ -23,7 +23,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: freeze_state.json
-          key: freeze-state-${{ github.run_id }}
+          key: freeze-state-v1
           restore-keys: |
             freeze-state-
       
