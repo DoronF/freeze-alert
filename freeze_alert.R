@@ -2,28 +2,41 @@
 
 # Freeze Alert System for Toronto Midtown
 # Two-alert system:
-#   1. ~3 hours before freeze (forecast-based)
-#   2. At 0°C (actual temperature)
+#   1. Warning when freeze forecast in 1-6 hours
+#   2. Alert when temperature actually hits 0°C
 # Tracks days since precipitation for ice risk assessment
 
 library(httr)
 library(jsonlite)
 
 # ============================================================================
-# CONFIGURATION - Set these in GitHub Secrets
+# CONFIGURATION
 # ============================================================================
 OPENWEATHER_API_KEY <- Sys.getenv("OPENWEATHER_API_KEY")
 NTFY_TOPIC <- Sys.getenv("NTFY_TOPIC")
 
-# Location: Toronto Midtown
 LAT <- 43.65
 LON <- -79.38
 
-# State file for tracking
 STATE_FILE <- "freeze_state.json"
+LOG_FILE <- "freeze_alert.log"
 
-# TEST MODE: Set to TRUE to send temp update every run, FALSE for freeze alerts only
 TEST_MODE <- FALSE
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+log_msg <- function(msg) {
+  timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+  log_line <- paste0("[", timestamp, "] ", msg, "\n")
+  cat(log_line)  # Print to console
+  cat(log_line, file = LOG_FILE, append = TRUE)  # Append to log file
+}
+
+log_state <- function(state) {
+  log_msg(paste("STATE:", toJSON(state, auto_unbox = TRUE)))
+}
 
 # ============================================================================
 # HELPER FUNCTIONS
@@ -59,19 +72,27 @@ get_forecast <- function() {
 
 load_state <- function() {
   if (file.exists(STATE_FILE)) {
-    fromJSON(STATE_FILE)
+    state <- fromJSON(STATE_FILE)
+    log_msg("Loaded existing state from file")
+    log_state(state)
+    return(state)
   } else {
-    list(
-      last_alert_3hr = NULL,
-      last_alert_freeze = NULL,
+    state <- list(
       temp_was_above_zero = TRUE,
+      last_alert_warning = NULL,
+      last_alert_freeze = NULL,
       last_precip_time = NULL
     )
+    log_msg("Created new state (no existing file)")
+    log_state(state)
+    return(state)
   }
 }
 
 save_state <- function(state) {
   write(toJSON(state, auto_unbox = TRUE), STATE_FILE)
+  log_msg("State saved to file")
+  log_state(state)
 }
 
 send_alert <- function(message, priority = "default") {
@@ -89,10 +110,10 @@ send_alert <- function(message, priority = "default") {
   )
   
   if (status_code(response) == 200) {
-    cat("Alert sent successfully\n")
+    log_msg("Alert sent successfully")
     return(TRUE)
   } else {
-    cat("Alert failed:", status_code(response), "\n")
+    log_msg(paste("Alert failed with status:", status_code(response)))
     return(FALSE)
   }
 }
@@ -102,16 +123,26 @@ days_since_precip <- function(last_precip_time) {
     return(NULL)
   }
   
-  days <- as.numeric(difftime(Sys.time(), 
-                               as.POSIXct(last_precip_time, tz = "UTC"), 
-                               units = "days"))
+  # Parse with America/Toronto timezone
+  precip_time <- as.POSIXct(last_precip_time, format = "%Y-%m-%d %H:%M:%S", tz = "America/Toronto")
+  days <- as.numeric(difftime(Sys.time(), precip_time, units = "days"))
   round(days, 1)
 }
 
 hours_until <- function(timestamp) {
-  hours <- as.numeric(difftime(as.POSIXct(timestamp, origin = "1970-01-01", tz = "UTC"),
-                               Sys.time(),
-                               units = "hours"))
+  # timestamp is Unix epoch from API - convert to Toronto time
+  future_time <- as.POSIXct(timestamp, origin = "1970-01-01", tz = "America/Toronto")
+  hours <- as.numeric(difftime(future_time, Sys.time(), units = "hours"))
+  round(hours, 1)
+}
+
+hours_since <- function(timestamp_str) {
+  if (is.null(timestamp_str)) {
+    return(NULL)
+  }
+  # Parse with America/Toronto timezone
+  past_time <- as.POSIXct(timestamp_str, format = "%Y-%m-%d %H:%M:%S", tz = "America/Toronto")
+  hours <- as.numeric(difftime(Sys.time(), past_time, units = "hours"))
   round(hours, 1)
 }
 
@@ -122,12 +153,13 @@ hours_until <- function(timestamp) {
 main <- function() {
   Sys.setenv(TZ = "America/Toronto")
   
-  cat("=== Freeze Alert Check ===\n")
-  cat("Time:", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z"), "\n")
+  log_msg("=== FREEZE ALERT CHECK START ===")
   
   # Get current weather
   current <- get_current_weather()
   current_temp <- current$main$temp
+  
+  log_msg(paste("Current temperature:", current_temp, "°C"))
   
   # Check for current precipitation
   has_precip <- FALSE
@@ -138,8 +170,7 @@ main <- function() {
     has_precip <- TRUE
   }
   
-  cat("Current temp:", current_temp, "°C\n")
-  cat("Precipitation now:", has_precip, "\n")
+  log_msg(paste("Precipitation now:", has_precip))
   
   # Get forecast
   forecast <- get_forecast()
@@ -149,8 +180,8 @@ main <- function() {
   
   # Update precipitation tracking
   if (has_precip) {
-    state$last_precip_time <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
-    cat("Precipitation detected! Updated last_precip_time\n")
+    state$last_precip_time <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    log_msg("Precipitation detected - updated last_precip_time")
   }
   
   # Check forecast for precipitation
@@ -158,14 +189,14 @@ main <- function() {
     if (!is.null(entry$rain$`3h`) && entry$rain$`3h` > 0) {
       if (is.null(state$last_precip_time)) {
         state$last_precip_time <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-        cat("Forecast shows precipitation - updating last_precip_time\n")
+        log_msg("Forecast shows rain - updated last_precip_time")
       }
       break
     }
     if (!is.null(entry$snow$`3h`) && entry$snow$`3h` > 0) {
       if (is.null(state$last_precip_time)) {
         state$last_precip_time <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
-        cat("Forecast shows precipitation - updating last_precip_time\n")
+        log_msg("Forecast shows snow - updated last_precip_time")
       }
       break
     }
@@ -188,7 +219,7 @@ main <- function() {
     if (is.null(days_dry)) {
       precip_msg <- "No recent precipitation data"
     } else if (days_dry < 0.5) {
-      precip_msg <- sprintf("Rain/snow within last 12 hours")
+      precip_msg <- "Rain/snow within last 12 hours"
     } else if (days_dry < 1) {
       precip_msg <- sprintf("Precipitation %.1f days ago", days_dry)
     } else {
@@ -203,18 +234,17 @@ main <- function() {
     }
     
     message <- sprintf(
-      "🌡️ Test Mode\n\nCurrent: %.1f°C\n%s%s\n\n(Will alert at freeze when test mode disabled)",
+      "🌡️ Test Mode\n\nCurrent: %.1f°C\n%s%s",
       current_temp,
       precip_msg,
       forecast_msg
     )
     
-    cat("\n*** SENDING TEST NOTIFICATION ***\n")
-    cat(message, "\n")
+    log_msg("TEST MODE: Sending test notification")
     send_alert(message, priority = "default")
     
     save_state(state)
-    cat("\nTest mode active. Check complete.\n")
+    log_msg("=== FREEZE ALERT CHECK END (TEST MODE) ===")
     return()
   }
   
@@ -234,110 +264,113 @@ main <- function() {
     }
   }
   
-  # ALERT 1: Forecast warning
-  freeze_in_3hrs <- NULL
-  if (current_temp > 0 && is.null(state$last_alert_3hr)) {
+  # ============================================================================
+  # STEP 1: Clean up expired warnings (24-hour TTL)
+  # ============================================================================
+  if (!is.null(state$last_alert_warning)) {
+    hrs_since_warning <- hours_since(state$last_alert_warning)
+    if (!is.null(hrs_since_warning) && hrs_since_warning > 24) {
+      log_msg(paste("Warning expired after", hrs_since_warning, "hours - resetting"))
+      state$last_alert_warning <- NULL
+    }
+  }
+  
+  # ============================================================================
+  # STEP 2: Determine current temperature state
+  # ============================================================================
+  currently_frozen <- current_temp <= 0
+  log_msg(paste("Currently frozen:", currently_frozen))
+  log_msg(paste("Was above zero (from state):", state$temp_was_above_zero))
+  
+  # ============================================================================
+  # STEP 3: Check if we should send FREEZE WARNING (forecast-based)
+  # ============================================================================
+  # Only look for freeze warnings if:
+  # - Temperature is currently ABOVE zero
+  # - We haven't sent a warning yet (or it expired)
+  
+  if (!currently_frozen && is.null(state$last_alert_warning)) {
+    log_msg("Checking forecast for freeze warning...")
+    
+    freeze_found <- NULL
     for (entry in forecast$list[1:min(3, length(forecast$list))]) {
       hrs_until_entry <- hours_until(entry$dt)
       
       if (entry$main$temp <= 0 && hrs_until_entry >= 1 && hrs_until_entry <= 6) {
-        freeze_in_3hrs <- list(temp = entry$main$temp, hours = hrs_until_entry)
-        cat("Found freeze forecast:", hrs_until_entry, "hours away at", freeze_in_3hrs$temp, "°C\n")
+        freeze_found <- list(temp = entry$main$temp, hours = hrs_until_entry)
+        log_msg(paste("Freeze forecast found:", hrs_until_entry, "hours away at", freeze_found$temp, "°C"))
         break
       }
     }
-  }
-  
-  if (!is.null(freeze_in_3hrs)) {
-    days_dry <- days_since_precip(state$last_precip_time)
-    risk_msg <- build_precip_msg(days_dry)
     
-    message <- sprintf(
-      "❄️ FREEZE WARNING\n\nCurrent temp: %.1f°C\n\nForecast to drop below freezing in approximately %.0f hours\n\nForecast: %.1f°C\n\n%s\n\nPrepare to salt the sidewalk!",
-      current_temp,
-      freeze_in_3hrs$hours,
-      freeze_in_3hrs$temp,
-      risk_msg
-    )
-    
-    cat("\n*** SENDING 3-HOUR WARNING ***\n")
-    cat(message, "\n")
-    
-    if (send_alert(message, priority = "high")) {
-      state$last_alert_3hr <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
-    }
-  }
-  
-  # ALERT 2: Freezing now
-  # CRITICAL: Only send if we've confirmed temp was recently above zero
-  # This prevents false alerts if state gets reset or script starts when already frozen
-  if (current_temp <= 0 && state$temp_was_above_zero) {
-    
-    # Double-check: Was there actually a recent warm period?
-    # If last_alert_3hr exists OR last_alert_freeze is very recent, it's legitimate
-    # Otherwise, this might be a state corruption - don't alert
-    is_legitimate_freeze <- FALSE
-    
-    # Check if we sent a warning in the last 12 hours
-    if (!is.null(state$last_alert_3hr)) {
-      is_legitimate_freeze <- TRUE
-      cat("Freeze alert is legitimate - warning was sent\n")
-    }
-    
-    # OR check if last freeze alert was more than 6 hours ago (meaning temp cycled up and down)
-    if (!is.null(state$last_alert_freeze)) {
-      last_freeze_time <- as.POSIXct(state$last_alert_freeze, format = "%Y-%m-%d %H:%M:%S")
-      hours_since_last <- as.numeric(difftime(Sys.time(), last_freeze_time, units = "hours"))
-      if (hours_since_last > 6) {
-        is_legitimate_freeze <- TRUE
-        cat("Freeze alert is legitimate - last freeze was", hours_since_last, "hours ago\n")
-      } else {
-        cat("Suppressing - last freeze alert was only", hours_since_last, "hours ago\n")
-      }
-    }
-    
-    # If this is the first run ever and temp is already frozen, DON'T alert
-    if (is.null(state$last_alert_3hr) && is.null(state$last_alert_freeze)) {
-      cat("Suppressing - no prior alerts, temp already frozen (likely script just started)\n")
-      is_legitimate_freeze <- FALSE
-    }
-    
-    if (is_legitimate_freeze) {
+    if (!is.null(freeze_found)) {
       days_dry <- days_since_precip(state$last_precip_time)
       risk_msg <- build_precip_msg(days_dry)
       
       message <- sprintf(
-        "❄️ FREEZE ALERT - ACT NOW\n\nCurrent temperature: %.1f°C\n\n%s\n\nTime to salt the sidewalk!",
+        "❄️ FREEZE WARNING\n\nCurrent temp: %.1f°C\n\nForecast to drop below freezing in approximately %.0f hours\n\nForecast: %.1f°C\n\n%s\n\nPrepare to salt the sidewalk!",
         current_temp,
+        freeze_found$hours,
+        freeze_found$temp,
         risk_msg
       )
       
-      cat("\n*** SENDING FREEZE ALERT ***\n")
-      cat(message, "\n")
-      
-      if (send_alert(message, priority = "urgent")) {
-        state$last_alert_freeze <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+      log_msg("SENDING FREEZE WARNING")
+      if (send_alert(message, priority = "high")) {
+        state$last_alert_warning <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
       }
+    } else {
+      log_msg("No freeze in forecast (1-6 hour window)")
     }
-    
-    state$temp_was_above_zero <- FALSE
-    
-  } else if (current_temp > 0) {
-    # Temperature is above freezing
-    # Only reset flags if we were previously frozen (completing a freeze cycle)
-    if (!state$temp_was_above_zero) {
-      cat("Temperature back above freezing - resetting alert state for next freeze cycle\n")
-      state$last_alert_3hr <- NULL
-      state$last_alert_freeze <- NULL
-    }
-    state$temp_was_above_zero <- TRUE
-    
-  } else {
-    cat("Temperature still below freezing (already alerted - suppressed)\n")
+  } else if (!currently_frozen && !is.null(state$last_alert_warning)) {
+    log_msg("Freeze warning already sent - suppressing repeat")
   }
   
+  # ============================================================================
+  # STEP 4: Check if we should send FREEZE ALERT (actual freeze happening)
+  # ============================================================================
+  # Only send freeze alert if:
+  # - Temperature is currently at/below zero
+  # - We were previously above zero (legitimate freeze event, not script startup)
+  
+  if (currently_frozen && state$temp_was_above_zero) {
+    log_msg("Temperature just dropped below freezing!")
+    
+    days_dry <- days_since_precip(state$last_precip_time)
+    risk_msg <- build_precip_msg(days_dry)
+    
+    message <- sprintf(
+      "❄️ FREEZE ALERT - ACT NOW\n\nCurrent temperature: %.1f°C\n\n%s\n\nTime to salt the sidewalk!",
+      current_temp,
+      risk_msg
+    )
+    
+    log_msg("SENDING FREEZE ALERT")
+    if (send_alert(message, priority = "urgent")) {
+      state$last_alert_freeze <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+    }
+    
+    # Mark that we're now frozen
+    state$temp_was_above_zero <- FALSE
+    
+  } else if (currently_frozen && !state$temp_was_above_zero) {
+    log_msg("Still frozen - freeze alert already sent, suppressing")
+  } else if (!currently_frozen && !state$temp_was_above_zero) {
+    # Temperature went from frozen back to above zero - RESET for next cycle
+    log_msg("Temperature rose above freezing - RESETTING all alerts for next freeze cycle")
+    state$temp_was_above_zero <- TRUE
+    state$last_alert_warning <- NULL
+    state$last_alert_freeze <- NULL
+  } else {
+    # currently not frozen and was above zero - normal monitoring state
+    log_msg("Normal monitoring - temp above zero, waiting for freeze forecast")
+  }
+  
+  # ============================================================================
+  # STEP 5: Save state and finish
+  # ============================================================================
   save_state(state)
-  cat("\nState saved. Check complete.\n")
+  log_msg("=== FREEZE ALERT CHECK END ===\n")
 }
 
 # ============================================================================
@@ -348,6 +381,7 @@ if (!interactive()) {
   tryCatch({
     main()
   }, error = function(e) {
+    log_msg(paste("ERROR:", e$message))
     cat("ERROR:", e$message, "\n")
     quit(status = 1)
   })
