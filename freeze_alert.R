@@ -269,32 +269,68 @@ main <- function() {
   }
   
   # ALERT 2: Freezing now
+  # CRITICAL: Only send if we've confirmed temp was recently above zero
+  # This prevents false alerts if state gets reset or script starts when already frozen
   if (current_temp <= 0 && state$temp_was_above_zero) {
-    days_dry <- days_since_precip(state$last_precip_time)
-    risk_msg <- build_precip_msg(days_dry)
     
-    message <- sprintf(
-      "❄️ FREEZE ALERT - ACT NOW\n\nCurrent temperature: %.1f°C\n\n%s\n\nTime to salt the sidewalk!",
-      current_temp,
-      risk_msg
-    )
+    # Double-check: Was there actually a recent warm period?
+    # If last_alert_3hr exists OR last_alert_freeze is very recent, it's legitimate
+    # Otherwise, this might be a state corruption - don't alert
+    is_legitimate_freeze <- FALSE
     
-    cat("\n*** SENDING FREEZE ALERT ***\n")
-    cat(message, "\n")
+    # Check if we sent a warning in the last 12 hours
+    if (!is.null(state$last_alert_3hr)) {
+      is_legitimate_freeze <- TRUE
+      cat("Freeze alert is legitimate - warning was sent\n")
+    }
     
-    if (send_alert(message, priority = "urgent")) {
-      state$last_alert_freeze <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+    # OR check if last freeze alert was more than 6 hours ago (meaning temp cycled up and down)
+    if (!is.null(state$last_alert_freeze)) {
+      last_freeze_time <- as.POSIXct(state$last_alert_freeze, format = "%Y-%m-%d %H:%M:%S")
+      hours_since_last <- as.numeric(difftime(Sys.time(), last_freeze_time, units = "hours"))
+      if (hours_since_last > 6) {
+        is_legitimate_freeze <- TRUE
+        cat("Freeze alert is legitimate - last freeze was", hours_since_last, "hours ago\n")
+      } else {
+        cat("Suppressing - last freeze alert was only", hours_since_last, "hours ago\n")
+      }
+    }
+    
+    # If this is the first run ever and temp is already frozen, DON'T alert
+    if (is.null(state$last_alert_3hr) && is.null(state$last_alert_freeze)) {
+      cat("Suppressing - no prior alerts, temp already frozen (likely script just started)\n")
+      is_legitimate_freeze <- FALSE
+    }
+    
+    if (is_legitimate_freeze) {
+      days_dry <- days_since_precip(state$last_precip_time)
+      risk_msg <- build_precip_msg(days_dry)
+      
+      message <- sprintf(
+        "❄️ FREEZE ALERT - ACT NOW\n\nCurrent temperature: %.1f°C\n\n%s\n\nTime to salt the sidewalk!",
+        current_temp,
+        risk_msg
+      )
+      
+      cat("\n*** SENDING FREEZE ALERT ***\n")
+      cat(message, "\n")
+      
+      if (send_alert(message, priority = "urgent")) {
+        state$last_alert_freeze <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+      }
     }
     
     state$temp_was_above_zero <- FALSE
     
   } else if (current_temp > 0) {
+    # Temperature is above freezing
+    # Only reset flags if we were previously frozen (completing a freeze cycle)
     if (!state$temp_was_above_zero) {
-      cat("Temperature back above freezing - resetting alert state\n")
+      cat("Temperature back above freezing - resetting alert state for next freeze cycle\n")
+      state$last_alert_3hr <- NULL
+      state$last_alert_freeze <- NULL
     }
     state$temp_was_above_zero <- TRUE
-    state$last_alert_3hr <- NULL
-    state$last_alert_freeze <- NULL
     
   } else {
     cat("Temperature still below freezing (already alerted - suppressed)\n")
