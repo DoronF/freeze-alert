@@ -73,6 +73,12 @@ get_forecast <- function() {
 load_state <- function() {
   if (file.exists(STATE_FILE)) {
     state <- fromJSON(STATE_FILE)
+    
+    # Fix empty objects that should be NULL
+    if (length(state$last_alert_warning) == 0) state$last_alert_warning <- NULL
+    if (length(state$last_alert_freeze) == 0) state$last_alert_freeze <- NULL
+    if (length(state$last_precip_time) == 0) state$last_precip_time <- NULL
+    
     log_msg("Loaded existing state from file")
     log_state(state)
     return(state)
@@ -90,7 +96,7 @@ load_state <- function() {
 }
 
 save_state <- function(state) {
-  write(toJSON(state, auto_unbox = TRUE), STATE_FILE)
+  write(toJSON(state, auto_unbox = TRUE, null = "null"), STATE_FILE)
   log_msg("State saved to file")
   log_state(state)
 }
@@ -137,7 +143,7 @@ hours_until <- function(timestamp) {
 }
 
 hours_since <- function(timestamp_str) {
-  if (is.null(timestamp_str)) {
+  if (is.null(timestamp_str) || length(timestamp_str) == 0) {
     return(NULL)
   }
   # Parse with America/Toronto timezone
