@@ -22,7 +22,9 @@ jobs:
       - name: Cache state file
         uses: actions/cache@v3
         with:
-          path: freeze_state.json
+          path: |
+            freeze_state.json
+            freeze_alert.log
           key: freeze-state-v1
           restore-keys: |
             freeze-state-
