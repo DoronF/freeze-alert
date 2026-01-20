@@ -95,7 +95,7 @@ load_state <- function() {
         return(state)
     } else {
         state <- list(
-            temp_was_above_zero = FALSE,
+            temp_was_above_zero = TRUE,
             last_alert_warning = NULL,
             last_alert_freeze = NULL,
             last_precip_time = NULL
