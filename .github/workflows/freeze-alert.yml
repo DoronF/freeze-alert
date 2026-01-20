@@ -25,7 +25,7 @@ jobs:
           path: |
             freeze_state.json
             freeze_alert.log
-          key: freeze-state-v1
+          key: freeze-state-v2
           restore-keys: |
             freeze-state-
       
